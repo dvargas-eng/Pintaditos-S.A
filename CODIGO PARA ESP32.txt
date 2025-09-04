@@ -1,0 +1,325 @@
+/*
+ * ESP32 - Pintaditos S.A.
+ * Fusion: Receptor Bluetooth + Control con DAC y Perfiles
+ *
+ * Comandos desde la app:
+ *  - MANUAL_MODE|START|<%>
+ *  - MANUAL_MODE|STOP
+ *  - AUTO_MODE|START|<tipo>|<min>|<max>|<periodo>
+ *      <tipo>: "Water" (Rampa) / "Oil" (Senoidal)
+ *  - AUTO_MODE|STOP
+ *
+ * Rango de trabajo: 0–3000 RPM  (mapea a 0–3.3 V en DAC)
+ * Periodo permitido (automático): 2–50 s
+ */
+
+#include "BluetoothSerial.h"
+#include <math.h>
+
+#ifndef PI
+#define PI 3.14159265358979323846
+#endif
+
+// ====== CONFIGURACIÓN DE PINES ======
+#define PIN_SALIDA_ANALOGICA 25   // DAC1 (GPIO25)
+#define PIN_LED_STATUS       2    // LED integrado
+
+// ====== BLUETOOTH ======
+BluetoothSerial SerialBT;
+String rxBuffer = "";
+bool btClientConnected = false;
+unsigned long cmdCounter = 0;
+
+// ====== MODO DE OPERACIÓN ======
+enum Modo { MANUAL, AUTOMATICO, PARADO };
+Modo modo_actual = PARADO;
+bool sistema_activo = false;
+
+// ====== RANGO DE TRABAJO (RPM) ======
+const int RPM_MIN_TRABAJO = 0;
+const int RPM_MAX_TRABAJO = 3000;
+
+// ====== PARÁMETROS MANUAL ======
+int porcentaje_manual = 0;    // % de velocidad recibido
+int velocidad_manual = 0;     // RPM calculadas a partir del %
+
+// ====== PARÁMETROS AUTOMÁTICO ======
+int vel_min = 0;                // RPM mín
+int vel_max = 2000;             // RPM máx
+float periodo = 10.0;           // s   (2–50)
+String perfil = "Water-Based";  // "Water-Based" / "Oil-Based"
+
+// ====== VARIABLES DE TIEMPO ======
+unsigned long t_inicio_modo = 0;
+unsigned long t_ultimo_status = 0;
+unsigned long t_ultimo_monitoreo = 0;
+const unsigned long INTERVALO_STATUS_MS    = 5000;
+const unsigned long INTERVALO_MONIT_MS     = 50;
+
+// ====== VARIABLES DE CÁLCULO ======
+float rpm_actual = 0.0;
+int valor_dac = 0;              // 0–255 (DAC interno)
+float valor_dac_filtrado = 0;   // DAC suavizado
+float voltajeDAC = 0.0;         // 0–3.3 V
+const float alpha = 0.15;       // Filtro exponencial (0.05 muy suave, 0.3 más rápido)
+
+// ====== UTILIDADES ======
+String getModoString() {
+  switch (modo_actual) {
+    case MANUAL:      return "MANUAL(" + String(porcentaje_manual) + "%)";
+    case AUTOMATICO:  return "AUTO-" + perfil + "(" + String(vel_min) + "-" + String(vel_max) + ")";
+    case PARADO:      return "PARADO";
+    default:          return "DESCONOCIDO";
+  }
+}
+
+String getTimestamp() {
+  unsigned long seconds = millis() / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours   = minutes / 60;
+  seconds %= 60; minutes %= 60;
+  return String(hours) + ":" + (minutes<10?"0":"") + String(minutes) + ":" + (seconds<10?"0":"") + String(seconds);
+}
+
+// ====== INICIALIZACIÓN ======
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_LED_STATUS, OUTPUT);
+  digitalWrite(PIN_LED_STATUS, LOW);
+  dacWrite(PIN_SALIDA_ANALOGICA, 0);
+
+  SerialBT.begin("ESP32_Device");
+
+  Serial.println("==========================================");
+  Serial.println("ESP32 Bluetooth + DAC Controller");
+  Serial.println("Pintaditos S.A.");
+  Serial.println("Nombre BT: ESP32_Device");
+  Serial.println("Comandos:");
+  Serial.println("  MANUAL_MODE|START|<% velocidad>");
+  Serial.println("  MANUAL_MODE|STOP");
+  Serial.println("  AUTO_MODE|START|<Water|Oil>|<min>|<max>|<periodo_s>");
+  Serial.println("  AUTO_MODE|STOP");
+  Serial.println("Rango RPM permitido: 0–3000");
+  Serial.println("Periodo permitido (automático): 2–50 s");
+  Serial.println("Esperando conexión Bluetooth...");
+  Serial.println("==========================================");
+}
+
+// ====== BUCLE PRINCIPAL ======
+void loop() {
+  bool curClient = SerialBT.hasClient();
+  if (curClient != btClientConnected) {
+    btClientConnected = curClient;
+    if (btClientConnected) Serial.println("🎉 ¡Dispositivo Android conectado!");
+    else Serial.println("❌ Dispositivo Android desconectado");
+  }
+
+  while (SerialBT.available()) {
+    char c = SerialBT.read();
+    if (c == '\n' || c == '\r') {
+      if (rxBuffer.length() > 0) {
+        procesarLineaComando(rxBuffer);
+        rxBuffer = "";
+      }
+    } else {
+      rxBuffer += c;
+    }
+  }
+
+  if (sistema_activo) {
+    switch (modo_actual) {
+      case MANUAL:      ejecutarModoManual();      break;
+      case AUTOMATICO:  ejecutarModoAutomatico();  break;
+      default: break;
+    }
+    digitalWrite(PIN_LED_STATUS, (millis() / 250) % 2);
+  } else {
+    digitalWrite(PIN_LED_STATUS, LOW);
+    dacWrite(PIN_SALIDA_ANALOGICA, 0);
+    rpm_actual = 0;
+    voltajeDAC = 0.0;
+    valor_dac_filtrado = 0;
+  }
+
+  if (millis() - t_ultimo_monitoreo >= INTERVALO_MONIT_MS) {
+    t_ultimo_monitoreo = millis();
+    enviarDatosMonitoreo();
+  }
+
+  if (millis() - t_ultimo_status >= INTERVALO_STATUS_MS) {
+    t_ultimo_status = millis();
+    mostrarEstadoConexion();
+  }
+
+  delay(5);
+}
+
+// ====== PROCESAMIENTO DE COMANDOS ======
+void procesarLineaComando(String data) {
+  data.trim();
+  if (data.length() == 0) return;
+
+  cmdCounter++;
+  Serial.println("==========================================");
+  Serial.println("📥 COMANDO #" + String(cmdCounter));
+  Serial.println("Hora: " + getTimestamp());
+  Serial.println("Texto: [" + data + "]");
+
+  SerialBT.println("OK|" + String(cmdCounter));
+
+  if (data.startsWith("MANUAL_MODE|")) {
+    if (data.indexOf("|START|") != -1) {
+      int p = data.lastIndexOf('|');
+      int percent = data.substring(p + 1).toInt();
+      percent = constrain(percent, 0, 100);
+
+      porcentaje_manual = percent;
+      velocidad_manual = map(percent, 0, 100, RPM_MIN_TRABAJO, RPM_MAX_TRABAJO);
+
+      iniciarManual();
+    } else if (data.indexOf("|STOP") != -1) {
+      detenerSistema();
+    } else {
+      formatoManualInvalido();
+    }
+  }
+  else if (data.startsWith("AUTO_MODE|")) {
+    if (data.indexOf("|START|") != -1) {
+      String params = data.substring(data.indexOf("|START|") + 7);
+      int s1 = params.indexOf('|');
+      int s2 = params.indexOf('|', s1 + 1);
+      int s3 = params.indexOf('|', s2 + 1);
+      if (s1 != -1 && s2 != -1 && s3 != -1) {
+        String tipo   = params.substring(0, s1);
+        int    vmin   = params.substring(s1 + 1, s2).toInt();
+        int    vmax   = params.substring(s2 + 1, s3).toInt();
+        float  T      = params.substring(s3 + 1).toFloat();
+
+        tipo.trim();
+        tipo.toUpperCase();
+        if (tipo.indexOf("WATER") != -1) perfil = "Water-Based";
+        else if (tipo.indexOf("OIL") != -1) perfil = "Oil-Based";
+        else perfil = "Water-Based";
+
+        bool ok = true;
+        if (vmax <= vmin) { ok = false; vmax = vmin + 100; if (vmax > RPM_MAX_TRABAJO) vmax = RPM_MAX_TRABAJO; }
+        if (T < 2.0f || T > 50.0f) { ok = false; T = constrain(T, 2.0f, 50.0f); }
+
+        vel_min = constrain(vmin, RPM_MIN_TRABAJO, RPM_MAX_TRABAJO);
+        vel_max = constrain(vmax, RPM_MIN_TRABAJO, RPM_MAX_TRABAJO);
+        periodo = T;
+
+        iniciarAutomatico();
+      } else {
+        formatoAutoInvalido();
+      }
+    } else if (data.indexOf("|STOP") != -1) {
+      detenerSistema();
+    } else {
+      formatoAutoInvalido();
+    }
+  }
+  else {
+    Serial.println("❓ Comando no reconocido");
+    imprimirAyuda();
+  }
+  Serial.println("==========================================");
+}
+
+void imprimirAyuda() {
+  Serial.println("Formato esperado:");
+  Serial.println("  MANUAL_MODE|START|<% velocidad>");
+  Serial.println("  MANUAL_MODE|STOP");
+  Serial.println("  AUTO_MODE|START|<Water|Oil>|<min>|<max>|<periodo_s>");
+  Serial.println("  AUTO_MODE|STOP");
+}
+
+void formatoManualInvalido() {
+  Serial.println("❌ MANUAL_MODE inválido.");
+}
+
+void formatoAutoInvalido() {
+  Serial.println("❌ AUTO_MODE inválido.");
+}
+
+// ====== CONTROL DE MODO ======
+void iniciarManual() {
+  modo_actual = MANUAL;
+  sistema_activo = true;
+  t_inicio_modo = millis();
+  Serial.println("🟢 >>> MODO MANUAL INICIADO <<<");
+  Serial.println("🟢 %: " + String(porcentaje_manual) + "% -> " + String(velocidad_manual) + " RPM");
+}
+
+void iniciarAutomatico() {
+  modo_actual = AUTOMATICO;
+  sistema_activo = true;
+  t_inicio_modo = millis();
+  Serial.println("🟢 >>> MODO AUTOMÁTICO INICIADO <<<");
+  Serial.println("🟢 Perfil: " + perfil + " | Rango: " + String(vel_min) + "-" + String(vel_max) + " RPM | T=" + String(periodo,2) + "s");
+}
+
+void detenerSistema() {
+  sistema_activo = false;
+  modo_actual = PARADO;
+  rpm_actual = 0;
+  valor_dac_filtrado = 0;
+  dacWrite(PIN_SALIDA_ANALOGICA, 0);
+  voltajeDAC = 0.0;
+  digitalWrite(PIN_LED_STATUS, LOW);
+  Serial.println("🔴 >>> SISTEMA DETENIDO <<< (DAC=0V)");
+}
+
+// ====== MODOS ======
+void ejecutarModoManual() {
+  rpm_actual = velocidad_manual;
+  valor_dac = map((int)rpm_actual, RPM_MIN_TRABAJO, RPM_MAX_TRABAJO, 0, 255);
+  valor_dac = constrain(valor_dac, 0, 255);
+
+  // Filtro exponencial
+  valor_dac_filtrado = alpha * valor_dac + (1 - alpha) * valor_dac_filtrado;
+
+  dacWrite(PIN_SALIDA_ANALOGICA, (int)valor_dac_filtrado);
+  voltajeDAC = (valor_dac_filtrado / 255.0f) * 3.3f;
+}
+
+void ejecutarModoAutomatico() {
+  float t = (millis() - t_inicio_modo) / 1000.0f;
+  float fase = fmod(t, periodo) / periodo;
+
+  if (perfil == "Water-Based") {
+    rpm_actual = vel_min + (vel_max - vel_min) * fase;
+  } else {
+    rpm_actual = vel_min + (vel_max - vel_min) * 0.5f * (1.0f - cosf(2.0f * PI * fase));
+  }
+
+  rpm_actual = constrain(rpm_actual, (float)vel_min, (float)vel_max);
+
+  valor_dac = map((int)rpm_actual, RPM_MIN_TRABAJO, RPM_MAX_TRABAJO, 0, 255);
+  valor_dac = constrain(valor_dac, 0, 255);
+
+  // Filtro exponencial
+  valor_dac_filtrado = alpha * valor_dac + (1 - alpha) * valor_dac_filtrado;
+
+  dacWrite(PIN_SALIDA_ANALOGICA, (int)valor_dac_filtrado);
+  voltajeDAC = (valor_dac_filtrado / 255.0f) * 3.3f;
+}
+
+// ====== TELEMETRÍA ======
+void enviarDatosMonitoreo() {
+  float tseg = (sistema_activo ? (millis() - t_inicio_modo) / 1000.0f : 0.0f);
+  String datos = "RPM:" + String(rpm_actual, 1) +
+                 " | V:" + String(voltajeDAC, 2) + "V" +
+                 " | T:" + String(tseg, 1) + "s" +
+                 " | Modo:" + getModoString();
+  Serial.println(datos);
+}
+
+void mostrarEstadoConexion() {
+  Serial.println("--- ESTADO DE CONEXIÓN ---");
+  Serial.println(String("Bluetooth: ") + (SerialBT.hasClient() ? "CONECTADO" : "DESCONECTADO"));
+  Serial.println("Comandos recibidos: " + String(cmdCounter));
+  if (sistema_activo) Serial.println("Modo actual: " + getModoString());
+  Serial.println("--------------------------");
+}
